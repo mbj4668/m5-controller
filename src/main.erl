@@ -1,6 +1,9 @@
 -module(main).
 -export([start/0]).
 
+-define(SSID, <<"mbj162">>).
+-define(PSK, <<"feedbabeff">>).
+
 -define(SLEEP_AFTER_IDLE_SECONDS, 30).
 -define(SLEEP_AFTER_ERROR_SECONDS, 60).
 
@@ -22,7 +25,7 @@
 -define(CH_Ö, 153).
 
 -record(state, {
-          endpoints,
+          shelly_plugs,
           selected
        }).
 
@@ -30,29 +33,33 @@
 -define(OFF, <<"av">>).
 -define(ERROR, <<"??">>).
 
-endpoints() ->
+shelly_plugs() ->
     [
-%     {<<"Stora huset">>,            {{192,168,2,10}, 80}}
-%    , {<<"Sj", ?CH_ö, "stugan">>,   {{192,168,2,11}, 80}}
-     {<<"Stora huset">>,            {{192,168,0,6}, 9010}}
-    , {<<"Sj", ?CH_ö, "stugan">>,   {{192,168,0,6}, 9011}}
+     {<<"Stora huset">>,            {{192,168,2,10}, 80}}
+    , {<<"Sj", ?CH_ö, "stugan">>,   {{192,168,2,11}, 80}}
+%     {<<"Stora huset">>,            {{192,168,0,6}, 9010}}
+%    , {<<"Sj", ?CH_ö, "stugan">>,   {{192,168,0,6}, 9011}}
 %    , {<<"G",?CH_ä, "ststugan">>, {192,168,2,12}}
 %    , {<<"Bastun">>,   {192,168,2,13}}
     ].
 
-read_endpoints() ->
-    [{Name, Ip, get(Ip)} || {Name, Ip} <- endpoints()].
-
-init_fake_endpoints() ->
-    put({192,168,2,10}, ?ON),
-    put({192,168,2,11}, ?OFF).
+read_shelly_plugs() ->
+    X=lists:map(
+      fun({Name, {Ip, Port} = Addr}) ->
+              case shelly_client:read(Ip, Port) of
+                  {ok, true} ->
+                      {Name, Addr, ?ON};
+                  {ok, false} ->
+                      {Name, Addr, ?OFF};
+                  _ ->
+                      {Name, Addr, ?ERROR}
+              end
+      end, shelly_plugs()),
+    erlang:display({plugs, X}),
+    X.
 
 start() ->
-    init_fake_endpoints(),
     m5:begin_([{clear_display, true}]),
-
-    erlang:display({w, m5_display:width()}),
-    erlang:display({h, m5_display:height()}),
 
     case m5_speaker:is_enabled() of
         true ->
@@ -75,7 +82,22 @@ start() ->
 
     m5_display:set_text_size(3),
 
-    scene_main(#state{endpoints = read_endpoints()}).
+    start_network(),
+
+    scene_main(#state{shelly_plugs = read_shelly_plugs()}).
+
+start_network() ->
+    Config = [
+              {ssid, ?SSID},
+              {psk,  ?PSK}
+             ],
+    case network:wait_for_sta(Config, 15000) of
+        {ok, {Address, _Netmask, _Gateway}} ->
+            io:format("Acquired IP address: ~p~n", [Address]);
+        {error, Reason} ->
+            print_error(Reason),
+            io:format("Network initialization failed: ~p~n", [Reason])
+    end.
 
 scene_main(S) ->
     print_scene(S),
@@ -107,16 +129,20 @@ scene_set_config(S) ->
     %% print_status(<<"Communicating...">>),
     %% m5_display:end_write(),
 
-    {_Name, Ip, Old} = lists:nth(S#state.selected, S#state.endpoints),
-    case rest_to_shelly(Ip, toggle(Old)) of
-        ok ->
+    {_, {Ip, Port}, Old} = lists:nth(S#state.selected, S#state.shelly_plugs),
+    Turn = case toggle(Old) of
+               ?ON -> "on";
+               ?OFF -> "off"
+           end,
+    case shelly_client:turn(Ip, Port, Turn) of
+        {ok, _} ->
             %print_ok(),
             %timer:sleep(1000),
-            scene_main(S#state{endpoints = read_endpoints()});
+            scene_main(S#state{shelly_plugs = read_shelly_plugs()});
         Error ->
             print_error(Error),
             wait_buttton_clicked(erlang:monotonic_time(second)),
-            scene_main(S#state{endpoints = read_endpoints()})
+            scene_main(S#state{shelly_plugs = read_shelly_plugs()})
     end.
 
 print_error(_Error) ->
@@ -158,15 +184,15 @@ goto_sleep() ->
     ok = esp:sleep_enable_ext0_wakeup(39, 0),
     m5_power:deep_sleep().
 
-toggle(?ON) -> ?OFF;
-toggle(?OFF) -> ?ON.
+toggle(?OFF) -> ?ON;
+toggle(_) -> ?OFF.
 
 next_row(undefined) -> 1;
 next_row(N) ->
-    1 + (N rem length(endpoints())).
+    1 + (N rem length(shelly_plugs())).
 
 print_scene(S) ->
-    #state{endpoints = Endpoints, selected = Sel} = S,
+    #state{shelly_plugs = ShellyPlugs, selected = Sel} = S,
     m5_display:clear(),
     m5_display:start_write(),
     print_header(),
@@ -174,7 +200,7 @@ print_scene(S) ->
       fun({Name, _, Val}, {Row, Idx}) ->
               print_row(Row, Name, Val, Idx == Sel),
               {Row + 2, Idx + 1}
-      end, {3, 1}, Endpoints),
+      end, {3, 1}, ShellyPlugs),
 
     %% button x-coord: 35, 130, 205
     Y = m5_display:height() - m5_display:font_height(),
@@ -224,27 +250,6 @@ wait_until_speaker_is_done() ->
             ok
     end.
 
-rest_to_shelly(Ip, Val) when Val /= undefined ->
-    lists:foreach(fun({_, EIp}) when EIp == Ip -> put(Ip, Val);
-                     (_) -> ok
-                  end, endpoints()),
-    ok;
-rest_to_shelly(Ip, Val) ->
-    HostStr = "localhost",
-    case gen_tcp:connect(Ip, 80, [{timeout, 10000}]) of
-        {ok, Sock} ->
-            Packet = [<<"GET /relay/0?">>, Val, <<" HTTP/1.1\r\n">>,
-                      <<"Host: ">>, HostStr],
-            case gen_tcp:send(Sock, Packet) of
-                ok ->
-                    gen_tcp:close(Sock),
-                    ok;
-                Error ->
-                    Error
-            end;
-        Error ->
-            Error
-    end.
 
 -ifdef(SOUND).
 m5_speaker_tone(Freq, Time) ->
